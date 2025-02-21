@@ -39,5 +39,5 @@ print(" Input data  | Prediction | Expected result | Status")
 print("-" * 60)
 for i in range(len(X)):
     match_status = "✅" if binary_predictions[i][0] == Y[i][0] else "❌"
-    print(f' {X[i]}    |    {binary_predictions[i][0]}    |          {Y[i][0]}           |     {match_status}')
+    print(f' {X[i]}    |    {binary_predictions[i][0]}      |          {Y[i][0]}      |     {match_status}')
 print("-" * 60)
