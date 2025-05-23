@@ -1,3 +1,7 @@
+import os
+import sys
+import requests
+import tarfile
 import pandas as pd
 import numpy as np
 import tensorflow as tf
@@ -6,216 +10,248 @@ from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 from IPython import display
 from jiwer import wer
-import requests
-import tarfile
-import os
 
-# Константи для конфігурації
-DATA_URL = "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
-LOCAL_TAR_PATH = "LJSpeech-1.1.tar.bz2"
-EXTRACT_DIR = "./LJSpeech-1.1"
-AUDIO_DIR = EXTRACT_DIR + "/wavs/"
-METADATA_PATH = EXTRACT_DIR + "/metadata.csv"
+# ### Конфігурація
+DATASET_URL = "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
+DATASET_DIR = "LJSpeech-1.1"
+WAVS_DIR = os.path.join(DATASET_DIR, "wavs")
+METADATA_PATH = os.path.join(DATASET_DIR, "metadata.csv")
+BATCH_SIZE = 32
+EPOCHS = 8
+RNN_UNITS = 512
 FRAME_LENGTH = 256
 FRAME_STEP = 160
 FFT_LENGTH = 384
-BATCH_SIZE = 32
 
-# Завантаження та розпакування датасету
+# ### Функція для завантаження та розпакування датасету
 def download_and_extract_dataset():
-    """Завантажує та розпаковує датасет LJSpeech, якщо його ще немає."""
-    if not os.path.exists(LOCAL_TAR_PATH):
-        print("Завантаження датасету LJSpeech...")
-        response = requests.get(DATA_URL, stream=True)
-        with open(LOCAL_TAR_PATH, "wb") as f:
-            f.write(response.content)
-        print("Завантаження завершено.")
+    """Завантажує та розпаковує датасет LJSpeech-1.1, якщо його ще немає."""
+    if not os.path.exists(DATASET_DIR):
+        print(f"Директорія {DATASET_DIR} не знайдена. Завантажуємо датасет...")
+        local_filename = "LJSpeech-1.1.tar.bz2"
+        try:
+            print("Завантаження датасету...")
+            response = requests.get(DATASET_URL, stream=True)
+            response.raise_for_status()
+            with open(local_filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("Датасет завантажено.")
+        except requests.exceptions.RequestException as e:
+            print(f"Помилка завантаження: {e}")
+            sys.exit(1)
+        try:
+            print("Розпакування датасету...")
+            with tarfile.open(local_filename, "r:bz2") as tar:
+                tar.extractall(path=".")
+            print("Датасет розпаковано.")
+        except tarfile.TarError as e:
+            print(f"Помилка розпакування: {e}")
+            sys.exit(1)
+        os.remove(local_filename)
+    else:
+        print(f"Датасет знайдено в {DATASET_DIR}.")
 
-    if not os.path.exists(EXTRACT_DIR):
-        print("Розпакування датасету...")
-        with tarfile.open(LOCAL_TAR_PATH, "r:bz2") as tar:
-            tar.extractall(path=".")
-        print("Розпакування завершено.")
+# ### Завантаження датасету
+download_and_extract_dataset()
 
-# Підготовка метаданих
-def prepare_metadata():
-    """Читає метадані, перемішує їх і розділяє на тренувальну та валідаційну вибірки."""
-    df = pd.read_csv(METADATA_PATH, sep="|", header=None, quoting=3)
-    df.columns = ["audio_file", "transcription", "normalized_transcript"]
-    df = df[["audio_file", "normalized_transcript"]]
-    df = df.sample(frac=1).reset_index(drop=True)
-    
-    split_idx = int(len(df) * 0.90)
-    return df[:split_idx], df[split_idx:]
+# ### Читання та підготовка метаданих
+metadata_df = pd.read_csv(METADATA_PATH, sep="|", header=None, quoting=3)
+metadata_df.columns = ["file_name", "transcription", "normalized_transcription"]
+metadata_df = metadata_df[["file_name", "normalized_transcription"]]
+metadata_df = metadata_df.sample(frac=1).reset_index(drop=True)
 
-# Перетворення символів у числа
-CHARACTERS = list("abcdefghijklmnopqrstuvwxyz'?! ")
-char_to_num = keras.layers.StringLookup(vocabulary=CHARACTERS, oov_token="")
+# Додавання повного шляху до файлів аудіо
+metadata_df["file_path"] = metadata_df["file_name"].apply(lambda x: os.path.join(WAVS_DIR, x + ".wav"))
+
+# Розділення на тренувальний і валідаційний набори
+split_index = int(len(metadata_df) * 0.90)
+train_df = metadata_df[:split_index]
+val_df = metadata_df[split_index:]
+
+# ### Визначення набору символів для кодування
+characters = list("abcdefghijklmnopqrstuvwxyz'?! ")
+char_to_num = keras.layers.StringLookup(vocabulary=characters, oov_token="")
 num_to_char = keras.layers.StringLookup(vocabulary=char_to_num.get_vocabulary(), oov_token="", invert=True)
 
-# Обробка одного зразка
-def process_sample(audio_file, transcript):
-    """
-    Обробляє один аудіофайл та його транскрипцію для моделі.
-    
-    Args:
-        audio_file (str): Базове ім'я аудіофайлу (без розширення).
-        transcript (str): Текст транскрипції.
-    
-    Returns:
-        tuple: (спектограма, числова транскрипція).
-    """
-    # Читання та декодування аудіо
-    file_path = AUDIO_DIR + audio_file + ".wav"
-    audio_content = tf.io.read_file(file_path)
-    audio, _ = tf.audio.decode_wav(audio_content)
+# ### Функція для кодування одного зразка
+def encode_single_sample(file_path, transcription):
+    """Кодує аудіофайл у спектрограму та транскрипцію у числовий формат."""
+    # Читання аудіофайлу
+    file = tf.io.read_file(file_path)
+    audio, _ = tf.audio.decode_wav(file)
     audio = tf.squeeze(audio, axis=-1)
     audio = tf.cast(audio, tf.float32)
     
-    # Обчислення спектограми
+    # Обчислення спектрограми
     spectrogram = tf.signal.stft(audio, frame_length=FRAME_LENGTH, frame_step=FRAME_STEP, fft_length=FFT_LENGTH)
     spectrogram = tf.abs(spectrogram)
     spectrogram = tf.math.pow(spectrogram, 0.5)
     
-    # Нормалізація по частотних бін
-    means = tf.math.reduce_mean(spectrogram, axis=1, keepdims=True)
-    stddevs = tf.math.reduce_std(spectrogram, axis=1, keepdims=True)
+    # Нормалізація спектрограми
+    means = tf.math.reduce_mean(spectrogram, 1, keepdims=True)
+    stddevs = tf.math.reduce_std(spectrogram, 1, keepdims=True)
     spectrogram = (spectrogram - means) / (stddevs + 1e-10)
     
-    # Обробка транскрипції
-    transcript = tf.strings.lower(transcript)
-    transcript = tf.strings.unicode_split(transcript, input_encoding="UTF-8")
-    transcript = char_to_num(transcript)
+    # Кодування тексту
+    transcription = tf.strings.lower(transcription)
+    transcription = tf.strings.unicode_split(transcription, input_encoding="UTF-8")
+    transcription = char_to_num(transcription)
     
-    return spectrogram, transcript
+    return spectrogram, transcription
 
-# Створення датасетів
-def create_datasets(train_df, val_df):
-    """Створює тренувальний та валідаційний датасети з метаданих."""
-    train_dataset = tf.data.Dataset.from_tensor_slices((train_df["audio_file"].tolist(), train_df["normalized_transcript"].tolist()))
-    train_dataset = (
-        train_dataset.map(process_sample, num_parallel_calls=tf.data.AUTOTUNE)
-        .padded_batch(BATCH_SIZE)
-        .prefetch(buffer_size=tf.data.AUTOTUNE)
-    )
+# ### Створення датасетів
+train_dataset = tf.data.Dataset.from_tensor_slices((train_df["file_path"], train_df["normalized_transcription"]))
+train_dataset = (
+    train_dataset.map(encode_single_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    .padded_batch(BATCH_SIZE)
+    .prefetch(buffer_size=tf.data.AUTOTUNE)
+)
+
+val_dataset = tf.data.Dataset.from_tensor_slices((val_df["file_path"], val_df["normalized_transcription"]))
+val_dataset = (
+    val_dataset.map(encode_single_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    .padded_batch(BATCH_SIZE)
+    .prefetch(buffer_size=tf.data.AUTOTUNE)
+)
+
+# ### Візуалізація одного зразка
+fig, ax = plt.subplots(2, 1, figsize=(8, 5))
+for batch in train_dataset.take(1):
+    spectrogram, label = batch[0][0], batch[1][0]
+    spectrogram = spectrogram.numpy()
+    spectrogram = np.array([np.trim_zeros(x) for x in np.transpose(spectrogram)])
+    label = tf.strings.reduce_join(num_to_char(label)).numpy().decode("utf-8")
     
-    val_dataset = tf.data.Dataset.from_tensor_slices((val_df["audio_file"].tolist(), val_df["normalized_transcript"].tolist()))
-    val_dataset = (
-        val_dataset.map(process_sample, num_parallel_calls=tf.data.AUTOTUNE)
-        .padded_batch(BATCH_SIZE)
-        .prefetch(buffer_size=tf.data.AUTOTUNE)
-    )
+    ax[0].imshow(spectrogram, vmax=1)
+    ax[0].set_title(f"Спектрограма: {label}")
+    ax[0].axis("off")
     
-    return train_dataset, val_dataset
+    file_path = train_df["file_path"].iloc[0]
+    file = tf.io.read_file(file_path)
+    audio, _ = tf.audio.decode_wav(file)
+    audio = audio.numpy()
+    
+    ax[1].plot(audio)
+    ax[1].set_title("Звукова хвиля")
+    ax[1].set_xlim(0, len(audio))
+    display.display(display.Audio(np.transpose(audio), rate=16000))
 
-# Візуалізація зразка (опціонально)
-def visualize_sample(dataset, audio_dir):
-    """Візуалізує спектограму та звукову хвилю одного зразка з датасету."""
-    for batch in dataset.take(1):
-        spectrogram = batch[0][0].numpy()
-        spectrogram = np.array([np.trim_zeros(x) for x in np.transpose(spectrogram)])
-        label = tf.strings.reduce_join(num_to_char(batch[1][0])).numpy().decode("utf-8")
-        
-        plt.figure(figsize=(8, 5))
-        ax1 = plt.subplot(2, 1, 1)
-        ax1.imshow(spectrogram, vmax=1)
-        ax1.set_title(label)
-        ax1.axis("off")
-        
-        audio_file = audio_dir + train_df["audio_file"].iloc[0] + ".wav"
-        audio_content = tf.io.read_file(audio_file)
-        audio, _ = tf.audio.decode_wav(audio_content)
-        audio = audio.numpy().flatten()
-        
-        ax2 = plt.subplot(2, 1, 2)
-        ax2.plot(audio)
-        ax2.set_title("Звукова хвиля")
-        ax2.set_xlim(0, len(audio))
-        
-        display.display(display.Audio(audio, rate=16000))
-        plt.show()
+plt.savefig('sample_visualization.png')
 
-# CTC втрати
+# ### Функція втрат CTC
 def ctc_loss(y_true, y_pred):
-    """
-    Обчислює CTC (Connectionist Temporal Classification) втрати для задачі розпізнавання мови.
-    
-    Args:
-        y_true: Реальні мітки.
-        y_pred: Передбачені логіти моделі.
-    
-    Returns:
-        float: Значення CTC втрати.
-    """
+    """Обчислює втрати CTC для батчу."""
     batch_len = tf.cast(tf.shape(y_true)[0], dtype="int64")
     input_length = tf.cast(tf.shape(y_pred)[1], dtype="int64")
-    label_length = tf.cast(tf.shape(y_true)[1], dtype="int64")
-    
+    label_length = tf.math.count_nonzero(y_true, axis=1, keepdims=True)
+    label_length = tf.cast(label_length, dtype="int64")
     input_length = input_length * tf.ones(shape=(batch_len, 1), dtype="int64")
-    label_length = label_length * tf.ones(shape=(batch_len, 1), dtype="int64")
-    
-    return keras.backend.ctc_batch_cost(y_true, y_pred, input_length, label_length)
+    loss = keras.backend.ctc_batch_cost(y_true, y_pred, input_length, label_length)
+    return loss
 
-# Побудова моделі
-def build_model(input_dim, output_dim, rnn_layers=5, rnn_units=128):
-    """
-    Створює модель, подібну до DeepSpeech2, для розпізнавання мови.
+# ### Побудова моделі DeepSpeech2
+def build_model(input_dim, output_dim, rnn_layers=5, rnn_units=RNN_UNITS):
+    """Створює модель, подібну до DeepSpeech2."""
+    input_spectrogram = layers.Input((None, input_dim), name="input")
+    x = layers.Reshape((-1, input_dim, 1), name="expand_dim")(input_spectrogram)
     
-    Args:
-        input_dim (int): Кількість частотних бін у спектограмі.
-        output_dim (int): Розмір словника (кількість символів).
-        rnn_layers (int): Кількість рекурентних шарів.
-        rnn_units (int): Кількість одиниць у кожному рекурентному шарі.
-    
-    Returns:
-        keras.Model: Скомпільована модель.
-    """
-    inputs = layers.Input(shape=(None, input_dim), name="input_spectrogram")
-    x = layers.Reshape((-1, input_dim, 1), name="expand_dims")(inputs)
-    
-    # Згорткові шари
-    x = layers.Conv2D(32, kernel_size=[11, 41], strides=[2, 2], padding="same", use_bias=False, name="conv_1")(x)
+    # Перший згортковий шар
+    x = layers.Conv2D(filters=32, kernel_size=[11, 41], strides=[2, 2], padding="same", use_bias=False, name="conv_1")(x)
     x = layers.BatchNormalization(name="conv_1_bn")(x)
     x = layers.ReLU(name="conv_1_relu")(x)
     
-    x = layers.Conv2D(32, kernel_size=[11, 21], strides=[1, 2], padding="same", use_bias=False, name="conv_2")(x)
+    # Другий згортковий шар
+    x = layers.Conv2D(filters=32, kernel_size=[11, 21], strides=[1, 2], padding="same", use_bias=False, name="conv_2")(x)
     x = layers.BatchNormalization(name="conv_2_bn")(x)
     x = layers.ReLU(name="conv_2_relu")(x)
     
-    # Переформатування для рекурентних шарів
-    x = layers.Reshape((-1, x.shape[-2] * x.shape[-1]), name="reshape_for_rnn")(x)
+    # Перетворення до послідовності
+    x = layers.Reshape((-1, x.shape[-2] * x.shape[-1]))(x)
     
-    # Рекурентні шари
+    # RNN шари
     for i in range(1, rnn_layers + 1):
-        gru = layers.GRU(rnn_units, return_sequences=True, name=f"gru_{i}")
-        x = layers.Bidirectional(gru, name=f"bidirectional_{i}")(x)
+        recurrent = layers.GRU(units=rnn_units, activation="tanh", recurrent_activation="sigmoid", use_bias=True, return_sequences=True, reset_after=True, name=f"gru_{i}")
+        x = layers.Bidirectional(recurrent, name=f"bidirectional_{i}", merge_mode="concat")(x)
         if i < rnn_layers:
-            x = layers.Dropout(0.5, name=f"dropout_{i}")(x)
+            x = layers.Dropout(rate=0.5)(x)
     
-    # Щільні шари
-    x = layers.Dense(rnn_units * 2, activation="relu", name="dense")(x)
-    x = layers.Dropout(0.5, name="dropout_dense")(x)
-    outputs = layers.Dense(output_dim + 1, activation="softmax", name="output")(x)
+    # Повнозв'язний шар
+    x = layers.Dense(units=rnn_units * 2)(x)
+    x = layers.ReLU()(x)
+    x = layers.Dropout(rate=0.5)(x)
     
-    model = keras.Model(inputs, outputs, name="DeepSpeech_2")
+    # Вихідний шар
+    output = layers.Dense(units=output_dim + 1, activation="softmax")(x)
+    
+    model = keras.Model(input_spectrogram, output, name="DeepSpeech_2")
     model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss=ctc_loss)
     return model
 
-# Основний потік виконання
-if __name__ == "__main__":
-    # Перевірка доступності GPU
-    print("----- Запуск -----")
-    
-    # Завантаження та підготовка даних
-    download_and_extract_dataset()
-    train_df, val_df = prepare_metadata()
-    train_dataset, validation_dataset = create_datasets(train_df, val_df)
-    
-    # Візуалізація (опціонально)
-    visualize_sample(train_dataset, AUDIO_DIR)
-    
-    # Побудова моделі
-    input_dim = FFT_LENGTH // 2 + 1  # Кількість частотних бін
-    output_dim = char_to_num.vocabulary_size()  # Розмір словника
-    model = build_model(input_dim, output_dim, rnn_units=512)
-    model.summary()
+# ### Створення моделі
+model = build_model(input_dim=FFT_LENGTH // 2 + 1, output_dim=char_to_num.vocabulary_size())
+model.summary(line_length=150)
+
+# ### Функція декодування передбачень
+def decode_batch_predictions(pred):
+    """Декодує передбачення моделі у текст."""
+    input_len = np.ones(pred.shape[0]) * pred.shape[1]
+    results = keras.backend.ctc_decode(pred, input_length=input_len, greedy=True)[0][0]
+    output_text = [tf.strings.reduce_join(num_to_char(result)).numpy().decode("utf-8") for result in results]
+    return output_text
+
+# ### Callback для оцінки після кожної епохи
+class EvaluationCallback(keras.callbacks.Callback):
+    def __init__(self, dataset):
+        super().__init__()
+        self.dataset = dataset
+
+    def on_epoch_end(self, epoch, logs=None):
+        predictions = []
+        targets = []
+        for batch in self.dataset:
+            X, y = batch
+            batch_predictions = model.predict(X, verbose=0)
+            batch_predictions = decode_batch_predictions(batch_predictions)
+            predictions.extend(batch_predictions)
+            for label in y:
+                label = tf.strings.reduce_join(num_to_char(label)).numpy().decode("utf-8")
+                targets.append(label)
+        wer_score = wer(targets, predictions)
+        print("-" * 100)
+        print(f"Word Error Rate: {wer_score:.4f}")
+        print("-" * 100)
+        for i in np.random.randint(0, len(predictions), 4):
+            print(f"Target    : {targets[i]}")
+            print(f"Prediction: {predictions[i]}")
+            print("-" * 100)
+
+# ### Тренування моделі
+validation_callback = EvaluationCallback(val_dataset)
+history = model.fit(
+    train_dataset,
+    validation_data=val_dataset,
+    epochs=EPOCHS,
+    callbacks=[validation_callback],
+)
+
+# ### Тестування моделі
+predictions = []
+targets = []
+for batch in val_dataset:
+    X, y = batch
+    batch_predictions = model.predict(X, verbose=0)
+    batch_predictions = decode_batch_predictions(batch_predictions)
+    predictions.extend(batch_predictions)
+    for label in y:
+        label = tf.strings.reduce_join(num_to_char(label)).numpy().decode("utf-8")
+        targets.append(label)
+
+wer_score = wer(targets, predictions)
+print("-" * 100)
+print(f"Word Error Rate: {wer_score:.4f}")
+print("-" * 100)
+for i in np.random.randint(0, len(predictions), 8):
+    print(f"Target    : {targets[i]}")
+    print(f"Prediction: {predictions[i]}")
+    print("-" * 100)
